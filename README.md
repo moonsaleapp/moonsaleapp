@@ -1,6 +1,6 @@
 # MoonSale — Multi-Chain EVM Token Launchpad
 
-MoonSale is a production-grade, permissionless presale and fair launch platform deployed on BNB Smart Chain and Base. Token creators can run fixed-rate presales or contribution-driven fair launches with automatic DEX listing, liquidity locking, and on-chain anti-rug protections — no approval required.
+MoonSale is a production-grade, permissionless presale and fair launch platform deployed on BNB Smart Chain and Base. Token creators can run fixed-rate presales or contribution-driven fair launches with automatic DEX listing, liquidity locking, and on-chain anti-rug protections, no approval required.
 
 Live at [moonsale.app](https://www.moonsale.app)
 
@@ -96,7 +96,7 @@ scripts/
 
 ### Fair Launch
 
-- Contribution-driven price discovery — no fixed rate set by creator
+- Contribution-driven price discovery, no fixed rate set by creator
 - Creator deposits full token supply; final price determined by total raise
 - Liquidity carved automatically from the pool at close
 - Optional whitelist gating with on/off toggle
