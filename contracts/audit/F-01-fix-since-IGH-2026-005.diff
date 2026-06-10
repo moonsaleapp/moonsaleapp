@@ -1,0 +1,55 @@
+diff --git a/contracts/contracts/lottery/MoonsaleLottery.sol b/contracts/contracts/lottery/MoonsaleLottery.sol
+index e0f4548..36e033b 100644
+--- a/contracts/contracts/lottery/MoonsaleLottery.sol
++++ b/contracts/contracts/lottery/MoonsaleLottery.sol
+@@ -229,9 +229,15 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+     ///         observed off-chain and the operator is forcing a retry.
+     event StuckDrawReset(uint256 indexed roundId, uint256 abandonedVrfRequestId, uint64 newEndTime);
+ 
+-    /// @notice Emitted when owner sets or changes the operator address.
++    /// @notice Emitted when owner sets or changes the operator to a non-zero address.
+     event OperatorUpdated(address indexed oldOperator, address indexed newOperator);
+ 
++    /// @notice Emitted when owner deliberately disables the operator (sets it to
++    ///         address(0)). A distinct event from OperatorUpdated so off-chain
++    ///         monitoring can unambiguously tell a disable apart from a normal
++    ///         operator change. [F-01]
++    event OperatorDisabled(address indexed previousOperator);
++
+     // ── Errors ─────────────────────────────────────────────────────────────────
+ 
+     error NoOpenRound();
+@@ -262,6 +268,7 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+     error NoActiveRound();                  // adminCreditOrphanedFunds
+     error InsufficientContractBalance();    // adminCreditOrphanedFunds
+     error NotOperatorOrOwner();             // onlyOperatorOrOwner modifier
++    error SameOperator();                   // setOperator no-op guard [F-01]
+ 
+     // ── Constructor ────────────────────────────────────────────────────────────
+ 
+@@ -648,13 +655,21 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+ 
+     // ── Admin: tunable params ──────────────────────────────────────────────────
+ 
+-    /// @notice Set (or clear) the operator address. Pass address(0) to disable
+-    ///         operator access entirely so that only the owner can post brackets.
++    /// @notice Set (or clear) the operator address. Pass address(0) to deliberately
++    ///         DISABLE operator access entirely so that only the owner can post
++    ///         brackets; this emits OperatorDisabled rather than OperatorUpdated.
+     /// @dev    The operator may ONLY call `postBracketCounts`; every other admin
+     ///         function remains owner-only. Intended for the backend automation
+-    ///         hot key.
++    ///         hot key. [F-01] Reverts on a no-op (newOperator == current operator)
++    ///         so the event log is a reliable changelog and zero->zero spam is
++    ///         impossible.
+     function setOperator(address newOperator) external onlyOwner {
+-        emit OperatorUpdated(operator, newOperator);
++        if (newOperator == operator) revert SameOperator();
++        if (newOperator == address(0)) {
++            emit OperatorDisabled(operator);
++        } else {
++            emit OperatorUpdated(operator, newOperator);
++        }
+         operator = newOperator;
+     }
+ 

@@ -1,0 +1,166 @@
+diff --git a/contracts/contracts/lottery/MoonsaleLottery.sol b/contracts/contracts/lottery/MoonsaleLottery.sol
+index 7341482..e0f4548 100644
+--- a/contracts/contracts/lottery/MoonsaleLottery.sol
++++ b/contracts/contracts/lottery/MoonsaleLottery.sol
+@@ -134,6 +134,16 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+     uint16    public treasuryPercent;
+     address   public treasuryWallet;
+ 
++    /// @notice Low-privilege operator allowed to call automation-only functions
++    ///         (currently only `postBracketCounts`). Set by owner via
++    ///         `setOperator`. This lets the always-on backend cron hold a hot key
++    ///         that can post bracket results without holding full owner powers —
++    ///         params, treasury, fund recovery, and round opening all remain
++    ///         `onlyOwner`. A leaked operator key can at worst distort the current
++    ///         round's bracket payout split; it cannot touch config, treasury, or
++    ///         other rounds. Defaults to address(0) (disabled) until owner sets it.
++    address   public operator;
++
+     // ── Round state ────────────────────────────────────────────────────────────
+ 
+     uint256 public currentRoundId;
+@@ -193,6 +203,13 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+     event NoBuyersRollover(uint256 indexed roundId, uint256 prizePoolToRollover);
+     event EmptyBracketRolledOver(uint256 indexed fromRound, uint256 indexed toRound, uint256 totalAmount);
+ 
++    /// @notice Admin credited orphaned USDT (sitting on the contract balance with no
++    ///         round binding) into the current OPEN round's prizePool. Used to recover
++    ///         from edge cases such as a zero-buyer round whose pool wasn't rolled
++    ///         over by an earlier contract version, or any direct USDT transfer to
++    ///         the contract that the protocol couldn't otherwise account for.
++    event OrphanedFundsCredited(uint256 indexed roundId, uint256 amount);
++
+     event TicketPriceUpdated(uint256 oldPrice, uint256 newPrice);
+     event XPBurnRateUpdated(uint256 oldRate, uint256 newRate);
+     event RoundDurationUpdated(uint256 oldDuration, uint256 newDuration);
+@@ -212,6 +229,9 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+     ///         observed off-chain and the operator is forcing a retry.
+     event StuckDrawReset(uint256 indexed roundId, uint256 abandonedVrfRequestId, uint64 newEndTime);
+ 
++    /// @notice Emitted when owner sets or changes the operator address.
++    event OperatorUpdated(address indexed oldOperator, address indexed newOperator);
++
+     // ── Errors ─────────────────────────────────────────────────────────────────
+ 
+     error NoOpenRound();
+@@ -239,6 +259,9 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+     error InvalidDuration();                // [M-02]
+     error InvalidDelay();                   // [M-02]
+     error EndTimeOverflow();                // [M-02]
++    error NoActiveRound();                  // adminCreditOrphanedFunds
++    error InsufficientContractBalance();    // adminCreditOrphanedFunds
++    error NotOperatorOrOwner();             // onlyOperatorOrOwner modifier
+ 
+     // ── Constructor ────────────────────────────────────────────────────────────
+ 
+@@ -270,6 +293,16 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+         treasuryPercent = 100;
+     }
+ 
++    // ── Modifiers ──────────────────────────────────────────────────────────────
++
++    /// @notice Restricts to the owner OR the designated operator. The owner
++    ///         always retains access; the operator is the optional low-privilege
++    ///         automation hot key. Reverts for everyone else.
++    modifier onlyOperatorOrOwner() {
++        if (msg.sender != operator && msg.sender != owner()) revert NotOperatorOrOwner();
++        _;
++    }
++
+     // ── Admin: round lifecycle ─────────────────────────────────────────────────
+ 
+     /**
+@@ -440,8 +473,16 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+         if (r.status != RoundStatus.OPEN) revert RoundNotReadyForDraw();
+         if (block.timestamp < uint256(r.endTime) + drawDelay) revert RoundNotReadyForDraw();
+ 
+-        // Zero-ticket round → just settle for rollover on next openRound
++        // Zero-ticket round → just settle for rollover on next openRound.
++        //
++        // [orphan-rollover fix] Park the entire prizePool into bracketAmounts[5]
++        // so the existing CLAIMABLE-branch rollover loop in openRound picks it up.
++        // Without this, the pool was bound only to `r.prizePool` and the rollover
++        // loop (which only inspects `bracketAmounts[]`) would miss it entirely —
++        // orphaning the funds on the contract balance. bracketCounts[5] stays 0,
++        // treasuryAmount stays 0 (no buyers, no treasury cut).
+         if (r.totalTickets == 0) {
++            r.bracketAmounts[5] = r.prizePool;
+             r.status = RoundStatus.CLAIMABLE; // empty: nothing to claim, full pool rolls
+             emit NoBuyersRollover(roundId, r.prizePool);
+             return;
+@@ -492,13 +533,13 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+     // ── Admin: post bracket counts ─────────────────────────────────────────────
+ 
+     /**
+-     * @notice Admin posts the off-chain-computed counts of winning tickets per
+-     *         bracket. Snapshots per-bracket USDT amounts from current
++     * @notice Owner or operator posts the off-chain-computed counts of winning
++     *         tickets per bracket. Snapshots per-bracket USDT amounts from current
+      *         bracketPercents/treasuryPercent and transfers treasury cut.
+      *         Round becomes CLAIMABLE.
+      * @param  counts  [Match-1, Match-2, Match-3, Match-4, Match-5, Match-6]
+      */
+-    function postBracketCounts(uint256 roundId, uint32[6] calldata counts) external onlyOwner {
++    function postBracketCounts(uint256 roundId, uint32[6] calldata counts) external onlyOperatorOrOwner {
+         Round storage r = rounds[roundId];
+         if (r.status != RoundStatus.RESULTS_PENDING) revert WrongRoundStatus();
+ 
+@@ -607,6 +648,16 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+ 
+     // ── Admin: tunable params ──────────────────────────────────────────────────
+ 
++    /// @notice Set (or clear) the operator address. Pass address(0) to disable
++    ///         operator access entirely so that only the owner can post brackets.
++    /// @dev    The operator may ONLY call `postBracketCounts`; every other admin
++    ///         function remains owner-only. Intended for the backend automation
++    ///         hot key.
++    function setOperator(address newOperator) external onlyOwner {
++        emit OperatorUpdated(operator, newOperator);
++        operator = newOperator;
++    }
++
+     function setTicketPrice(uint256 newPrice) external onlyOwner {
+         if (newPrice < MIN_TICKET_PRICE || newPrice > MAX_TICKET_PRICE) revert InvalidTicketPrice();
+         emit TicketPriceUpdated(ticketPrice, newPrice);
+@@ -718,6 +769,41 @@ contract MoonsaleLottery is Pausable, ReentrancyGuard, VRFConsumerBaseV2Plus {
+         emit StuckDrawReset(roundId, abandonedReq, r.endTime);
+     }
+ 
++    // ── Admin: orphan recovery ─────────────────────────────────────────────────
++
++    /**
++     * @notice Credit USDT sitting on the contract balance into the current OPEN
++     *         round's prizePool. Use this to recover funds orphaned by edge
++     *         cases — e.g. a zero-buyer round in a pre-fix contract version,
++     *         or a direct USDT transfer to the contract that the protocol
++     *         can't otherwise account for.
++     *
++     *         The admin is responsible for verifying off-chain that `amount`
++     *         only covers truly-orphaned funds and not USDT owed to past
++     *         claimers (sum of `bracketAmounts[i] - bracketPaid[i]` across all
++     *         CLAIMABLE rounds, plus the current round's `prizePool`).
++     *
++     *         Safety: only callable when the current round is OPEN. Bounded
++     *         by the contract's USDT balance so the call cannot inflate
++     *         prizePool past what's actually on hand.
++     */
++    function adminCreditOrphanedFunds(uint256 amount) external onlyOwner {
++        if (currentRoundId == 0) revert NoActiveRound();
++        Round storage r = rounds[currentRoundId];
++        if (r.status != RoundStatus.OPEN) revert WrongRoundStatus();
++
++        uint256 bal = usdt.balanceOf(address(this));
++        // [orphan-hardening] The advertised prizePool must never exceed the USDT
++        // actually on hand. Bounding `r.prizePool + amount` (not just `amount`)
++        // closes a double-credit footgun: crediting the same orphaned funds twice
++        // would inflate prizePool past the contract balance, so the tail of claims
++        // for that round would revert. This makes the contract self-protecting.
++        if (r.prizePool + amount > bal) revert InsufficientContractBalance();
++
++        r.prizePool += amount;
++        emit OrphanedFundsCredited(currentRoundId, amount);
++    }
++
+     // ── Admin: emergency pause ─────────────────────────────────────────────────
+ 
+     function pause()   external onlyOwner { _pause(); }
